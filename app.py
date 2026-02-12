@@ -1,9 +1,14 @@
+import os
+from datetime import datetime
+from typing import Optional, Tuple
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 
-DATA_PATH = "Data/2025_Runners_all_results.csv"
+DEFAULT_POSTGRES_TABLE = "marathon_results_2025"
+DEFAULT_POSTGRES_CACHE_TTL_SECONDS = 300
 TOP_N_MIN = 8
 TOP_N_MAX = 50
 TOP_N_DEFAULT = 24
@@ -146,16 +151,36 @@ def make_country_label(country: str, alpha3: str) -> str:
     return f"{flag_emoji_from_alpha2(alpha2)} {country}"
 
 
-@st.cache_data
-def load_data() -> pd.DataFrame:
-    # Source file includes extended characters, so latin1 is required.
-    return pd.read_csv(DATA_PATH, encoding="latin1")
+def get_config_value(key: str, default: Optional[str] = None) -> Optional[str]:
+    if key in st.secrets:
+        return str(st.secrets[key])
+    return os.getenv(key, default)
 
 
-@st.cache_data
-def load_raw_csv() -> bytes:
-    with open(DATA_PATH, "rb") as f:
-        return f.read()
+def get_postgres_config() -> Tuple[str, Optional[str]]:
+    database_url = get_config_value("SUPABASE_DB_URL") or get_config_value("DATABASE_URL")
+    query = get_config_value("RESULTS_QUERY")
+    table = get_config_value("RESULTS_TABLE", DEFAULT_POSTGRES_TABLE)
+    if query:
+        return database_url or "", query
+    return database_url or "", f'SELECT * FROM "{table}"'
+
+
+@st.cache_data(ttl=DEFAULT_POSTGRES_CACHE_TTL_SECONDS)
+def load_postgres_data(database_url: str, query: str) -> Tuple[pd.DataFrame, str]:
+    df = pd.read_sql_query(query, database_url)
+    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return df, fetched_at
+
+
+def load_data() -> Tuple[pd.DataFrame, Optional[str]]:
+    database_url, query = get_postgres_config()
+    if not database_url:
+        raise ValueError(
+            "No DB URL was provided. Set SUPABASE_DB_URL (or DATABASE_URL)."
+        )
+    df, fetched_at = load_postgres_data(database_url, query or "")
+    return df, fetched_at
 
 
 def build_country_counts(df: pd.DataFrame) -> pd.DataFrame:
@@ -249,20 +274,15 @@ def render_styles() -> None:
     )
 
 
-def render_sidebar(total_runners: int, total_countries: int) -> int:
+def render_sidebar(
+    df: pd.DataFrame,
+    total_runners: int,
+    total_countries: int,
+    last_supabase_fetch: Optional[str],
+) -> int:
     with st.sidebar:
         st.header("Control panel")
         st.caption("Adjust the ranking scope without modifying the base data.")
-        st.metric("Countries available", f"{total_countries:,}")
-        st.metric("Total runners", f"{total_runners:,}")
-        st.download_button(
-            label="Download full CSV",
-            data=load_raw_csv(),
-            file_name="2025_Runners_all_results.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-        st.divider()
         top_n = st.slider(
             "Top countries shown",
             min_value=TOP_N_MIN,
@@ -272,6 +292,20 @@ def render_sidebar(total_runners: int, total_countries: int) -> int:
             help="Control how many countries appear in the horizontal bar chart.",
         )
         st.caption(f"Showing {top_n} of {total_countries} countries.")
+        st.metric("Countries available", f"{total_countries:,}")
+        st.metric("Total runners", f"{total_runners:,}")
+        st.download_button(
+            label="Download query results (CSV)",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="boston_marathon_results.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.caption(f"Supabase cache TTL: {DEFAULT_POSTGRES_CACHE_TTL_SECONDS} seconds")
+        if last_supabase_fetch:
+            st.caption(f"Last Supabase connection: {last_supabase_fetch}")
+        else:
+            st.caption("Last Supabase connection: unavailable")
     return top_n
 
 
@@ -304,7 +338,7 @@ def build_figure(chart_data: pd.DataFrame) -> go.Figure:
     )
     fig.update_layout(
         height=max(560, len(chart_data) * 34),
-        margin=dict(l=15, r=110, t=8, b=20),
+        margin=dict(l=15, r=110, t=8, b=90),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         barmode="stack",
@@ -321,20 +355,84 @@ def build_figure(chart_data: pd.DataFrame) -> go.Figure:
         ),
         legend=dict(
             orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="left",
-            x=0,
+            yanchor="top",
+            y=-0.12,
+            xanchor="center",
+            x=0.5,
         ),
     )
     return fig
+
+
+def heatmap_cell_style(value: float, low: float, high: float, is_constant: bool = False) -> str:
+    if pd.isna(value):
+        return ""
+
+    if is_constant:
+        return "background-color: rgb(241, 245, 249); color: #475569;"
+
+    intensity = max(0.0, min(1.0, (float(value) - low) / (high - low)))
+    intensity = intensity**0.75
+
+    light_rgb = (239, 246, 255)
+    dark_rgb = (30, 64, 175)
+    red = int(light_rgb[0] + (dark_rgb[0] - light_rgb[0]) * intensity)
+    green = int(light_rgb[1] + (dark_rgb[1] - light_rgb[1]) * intensity)
+    blue = int(light_rgb[2] + (dark_rgb[2] - light_rgb[2]) * intensity)
+    text_color = "#0f172a" if intensity < 0.55 else "white"
+    return f"background-color: rgb({red}, {green}, {blue}); color: {text_color};"
+
+
+def column_scale_bounds(series: pd.Series) -> tuple[float, float, bool]:
+    values = series.dropna().astype(float)
+    if values.empty:
+        return 0.0, 1.0, True
+
+    vmin = float(values.min())
+    vmax = float(values.max())
+    if vmax <= vmin:
+        return vmin, vmax, True
+
+    low = float(values.quantile(0.05))
+    high = float(values.quantile(0.95))
+    if high <= low:
+        low, high = vmin, vmax
+    return low, high, False
+
+
+def build_heatmap_table(chart_data: pd.DataFrame):
+    table = chart_data[
+        ["CountryLabel", "Runners", "Women", "Men", "Non-binary/Other"]
+    ].rename(
+        columns={
+            "CountryLabel": "Country",
+            "Runners": "Total runners",
+        }
+    )
+    numeric_cols = ["Total runners", "Women", "Men", "Non-binary/Other"]
+    styler = table.style.format({col: "{:,.0f}" for col in numeric_cols})
+    for col in numeric_cols:
+        low, high, is_constant = column_scale_bounds(table[col])
+        styler = styler.applymap(
+            lambda value, lo=low, hi=high, const=is_constant: heatmap_cell_style(value, lo, hi, const),
+            subset=[col],
+        )
+    return styler.set_properties(subset=["Country"], **{"font-weight": "600"})
 
 
 def main() -> None:
     st.set_page_config(page_title="Boston Marathon 2025", layout="centered")
     render_styles()
 
-    df = load_data()
+    try:
+        df, last_supabase_fetch = load_data()
+    except Exception as exc:
+        st.error(f"Unable to load data source: {exc}")
+        st.info(
+            "Configure SUPABASE_DB_URL/DATABASE_URL and RESULTS_TABLE/RESULTS_QUERY for Postgres."
+        )
+        st.stop()
+
     country_counts = build_country_counts(df)
 
     top_country = country_counts.iloc[0]
@@ -354,26 +452,18 @@ def main() -> None:
     )
 
     top_n = render_sidebar(
+        df=df,
         total_runners=int(country_counts["Runners"].sum()),
         total_countries=country_counts.shape[0],
+        last_supabase_fetch=last_supabase_fetch,
     )
 
     chart_data = country_counts.head(top_n)
     st.plotly_chart(build_figure(chart_data), use_container_width=True)
 
     st.caption("Source: 2025 Boston Marathon runners results")
-    st.dataframe(
-        chart_data[
-            ["CountryLabel", "Runners", "Women", "Men", "Non-binary/Other", "Unspecified"]
-        ].rename(
-            columns={
-                "CountryLabel": "Country",
-                "Runners": "Total runners",
-            }
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.caption("Heatmap: darker blue means a higher value within each metric column.")
+    st.dataframe(build_heatmap_table(chart_data), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
