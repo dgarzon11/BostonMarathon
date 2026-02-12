@@ -226,7 +226,7 @@ def render_styles() -> None:
                 padding-bottom: 1.5rem;
             }
             .hero {
-                border-left: 14px solid #000080;
+                border-left: 14px solid #facc15;
                 padding: 0.35rem 1rem 0.65rem 1rem;
                 margin-bottom: 1.2rem;
                 background: rgba(255, 255, 255, 0.38);
@@ -342,8 +342,9 @@ def build_figure(chart_data: pd.DataFrame) -> go.Figure:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         barmode="stack",
+        xaxis_title=None,
         xaxis=dict(
-            title=None,
+            title=dict(text=""),
             gridcolor="rgba(15, 23, 42, 0.08)",
             zeroline=False,
             showticklabels=False,
