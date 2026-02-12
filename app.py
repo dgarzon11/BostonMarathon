@@ -343,11 +343,11 @@ def build_figure(chart_data: pd.DataFrame) -> go.Figure:
         plot_bgcolor="rgba(0,0,0,0)",
         barmode="stack",
         xaxis=dict(
-            title="Number of Runners",
+            title=None,
             gridcolor="rgba(15, 23, 42, 0.08)",
             zeroline=False,
-            tickfont=dict(color="#334155"),
-            title_font=dict(color="#334155"),
+            showticklabels=False,
+            ticks="",
         ),
         yaxis=dict(
             autorange="reversed",
